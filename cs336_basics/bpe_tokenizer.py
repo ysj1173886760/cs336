@@ -9,6 +9,10 @@ import pickle
 from heapdict import heapdict
 from functools import wraps
 from typing import Iterable, Iterator
+from tqdm import tqdm
+import cProfile
+import random
+import heapq
 
 
 def timing(func):
@@ -139,17 +143,25 @@ class BPETokenizerTrainer:
     @timing
     def train(self, occur_dict: dict[tuple[bytes], int]):
         occur_pair_dict: dict[tuple[bytes, bytes], int] = defaultdict(int)
-        pair_to_word_dict: dict[tuple[bytes, bytes], set[tuple[bytes]]] = defaultdict(
-            set
+        pair_to_word_dict: dict[tuple[bytes, bytes], set] = defaultdict(
+            lambda: defaultdict(int)
         )
 
+        # remap occur dict
+        id_to_sequence_dict: dict[int, tuple[bytes]] = {
+            idx: sequence for idx, sequence in enumerate(occur_dict.keys())
+        }
+        occur_dict_new: dict[int, int] = {
+            id: occur_dict[sequence] for id, sequence in id_to_sequence_dict.items()
+        }
+        occur_dict: dict[int, int] = occur_dict_new
+
         last_time = time.time()
-        for byte_sequence, freq in occur_dict.items():
+        for seq_id, freq in occur_dict.items():
+            byte_sequence = id_to_sequence_dict[seq_id]
             for i in range(len(byte_sequence) - 1):
                 occur_pair_dict[(byte_sequence[i], byte_sequence[i + 1])] += freq
-                pair_to_word_dict[(byte_sequence[i], byte_sequence[i + 1])].add(
-                    byte_sequence
-                )
+                pair_to_word_dict[(byte_sequence[i], byte_sequence[i + 1])][seq_id] += 1
 
         freq_heap = heapdict()
         for pair, freq in occur_pair_dict.items():
@@ -160,8 +172,9 @@ class BPETokenizerTrainer:
         assert len(self.history_merges) == 0
 
         merge_count = self.vocab_size - len(self.vocab)
+        # merge_count = min(merge_count, 100)
 
-        for epoch in range(merge_count):
+        for epoch in tqdm(range(merge_count)):
             last_time = time.time()
             candidate_pair, candidate_freq = freq_heap.peekitem()
             self.time_statictics["calc_candidate"] += time.time() - last_time
@@ -180,24 +193,22 @@ class BPETokenizerTrainer:
 
             last_time = time.time()
             # update occur dict
-            word_list = deepcopy(pair_to_word_dict[candidate_pair])
-            for byte_sequence in word_list:
-                freq = occur_dict.pop(byte_sequence)
-                # remove origin freq.
-                for i in range(len(byte_sequence) - 1):
-                    pair = (byte_sequence[i], byte_sequence[i + 1])
-                    pair_to_word_dict[pair].discard(byte_sequence)
-                    occur_pair_dict[pair] -= freq
-                    (origin_freq, bytes0, bytes1) = freq_heap[pair]
-                    freq_heap[pair] = (-occur_pair_dict[pair], bytes0, bytes1)
+            word_id_list = list(pair_to_word_dict[candidate_pair].keys())
+            for word_id in word_id_list:
+                freq = occur_dict[word_id]
+                byte_sequence = id_to_sequence_dict[word_id]
                 # generate new sequence
                 index = 0
+                old_change_position = []
+                new_change_position = []
                 new_sequence = []
                 while index < len(byte_sequence):
                     if (index < len(byte_sequence) - 1) and (
                         byte_sequence[index],
                         byte_sequence[index + 1],
                     ) == candidate_pair:
+                        old_change_position.append(index)
+                        new_change_position.append(len(new_sequence))
                         new_sequence.append(
                             byte_sequence[index] + byte_sequence[index + 1]
                         )
@@ -206,25 +217,57 @@ class BPETokenizerTrainer:
                         new_sequence.append(byte_sequence[index])
                         index += 1
                 new_sequence = tuple(new_sequence)
-                occur_dict[new_sequence] += freq
+                id_to_sequence_dict[word_id] = new_sequence
 
-                for i in range(len(new_sequence) - 1):
-                    new_pair = (new_sequence[i], new_sequence[i + 1])
-                    pair_to_word_dict[new_pair].add(new_sequence)
-                    occur_pair_dict[new_pair] += freq
+                # calc changed pair
+                # for every pair, change index - 1, index, index + 1
+                pairs_to_remove = []
+                pairs_to_add = []
+                for index in old_change_position:
+                    pairs_to_remove.append(
+                        (byte_sequence[index], byte_sequence[index + 1])
+                    )
+                    if index > 0:
+                        pairs_to_remove.append(
+                            (byte_sequence[index - 1], byte_sequence[index])
+                        )
+                    if index + 2 < len(byte_sequence):
+                        pairs_to_remove.append(
+                            (byte_sequence[index + 1], byte_sequence[index + 2])
+                        )
+                for index in new_change_position:
+                    if index > 0:
+                        pairs_to_add.append(
+                            (new_sequence[index - 1], new_sequence[index])
+                        )
+                    if index + 1 < len(new_sequence) and (
+                        new_sequence[index] != new_sequence[index + 1]
+                    ):
+                        pairs_to_add.append(
+                            (new_sequence[index], new_sequence[index + 1])
+                        )
 
-                    if new_pair in freq_heap:
-                        (origin_freq, bytes0, bytes1) = freq_heap[new_pair]
-                        freq_heap[new_pair] = (
-                            -occur_pair_dict[new_pair],
+                for pair in pairs_to_remove:
+                    pair_to_word_dict[pair][word_id] -= 1
+                    if pair_to_word_dict[pair][word_id] == 0:
+                        del pair_to_word_dict[pair][word_id]
+                    occur_pair_dict[pair] -= freq
+                    (origin_freq, bytes0, bytes1) = freq_heap[pair]
+                    freq_heap[pair] = (-occur_pair_dict[pair], bytes0, bytes1)
+
+                for pair in pairs_to_add:
+                    pair_to_word_dict[pair][word_id] += 1
+                    occur_pair_dict[pair] += freq
+                    if pair in freq_heap:
+                        (origin_freq, bytes0, bytes1) = freq_heap[pair]
+                        freq_heap[pair] = (
+                            -occur_pair_dict[pair],
                             bytes0,
                             bytes1,
                         )
                     else:
                         # calc new pair
-                        freq_heap[new_pair] = self.get_sort_key(
-                            occur_pair_dict[new_pair], new_pair
-                        )
+                        freq_heap[pair] = self.get_sort_key(occur_pair_dict[pair], pair)
 
             self.time_statictics["calc_occur_dict"] += time.time() - last_time
 
@@ -240,44 +283,73 @@ class BPETokenizerTrainer:
         return occur_dict
 
     @timing
-    def train_from_scratch(self, path: str, process_num: int):
+    def train_from_scratch(
+        self,
+        path: str,
+        process_num: int,
+        chunk_num: int = 16,
+        streaming_mode: bool = False,
+    ):
         occur_dict: dict[tuple[bytes], int] = defaultdict(int)
 
         last_time = time.time()
-        chunks = BPETokenizerTrainer.read_from_path(path, process_num=process_num)
+        chunk_iter = BPETokenizerTrainer.read_from_path(path, chunk_num=chunk_num)
+        chunks = []
+        for chunk in chunk_iter:
+            chunks.append(chunk)
         print(f"io consumption {time.time() - last_time}")
 
         last_time = time.time()
         # pre tokenization and init initial occurency dict
-        with ProcessPoolExecutor(max_workers=process_num) as pool:
-            futures = [
-                pool.submit(
-                    BPETokenizerTrainer.single_process_pretokenization,
-                    chunk,
-                    self.tok_re,
-                    self.split_by_special_re,
-                )
-                for chunk in chunks
-            ]
-            for f in as_completed(futures):
-                for sequence, freq in f.result().items():
-                    occur_dict[sequence] += freq
+
+        def pretokenize_batch(chunks: list[str]):
+            with ProcessPoolExecutor(max_workers=process_num) as pool:
+                futures = [
+                    pool.submit(
+                        BPETokenizerTrainer.single_process_pretokenization,
+                        chunk,
+                        self.tok_re,
+                        self.split_by_special_re,
+                    )
+                    for chunk in chunks
+                ]
+                for f in as_completed(futures):
+                    for sequence, freq in f.result().items():
+                        occur_dict[sequence] += freq
+
+        if streaming_mode:
+            # batch submit, may not much efficient
+            for i in tqdm(range(0, len(chunks), process_num)):
+                pretokenize_batch(chunks[i : i + process_num])
+        else:
+            pretokenize_batch(chunks)
 
         self.time_statictics["pre_tokenize"] += time.time() - last_time
         print(f"pre tokenize {time.time() - last_time}")
 
+        # profiler = cProfile.Profile()
+        # profiler.enable()
+
         self.train(occur_dict)
+
+        # profiler.disable()
+        # profiler.dump_stats("profile.out")
 
     def print_time_statictics(self):
         print(f"print time statistics")
         for name, time_consumption in self.time_statictics.items():
             print(f"{name} {time_consumption}")
 
+    def save_to(self, path: str):
+        print(f"save tokenizer to path: {path}")
+        result_dict = {"vocab": self.vocab, "merges": self.history_merges}
+        with open(path, "wb") as f:
+            pickle.dump(result_dict, f)
+
     @staticmethod
-    def read_from_path(file_path: str, process_num: int = 1) -> list[str]:
-        chunk_list = []
+    def read_from_path(file_path: str, chunk_num: int = 1) -> Iterator[str]:
         with open(file_path, "rb") as f:
-            boundaries = find_chunk_boundaries(f, process_num, b"<|endoftext|>")
+            boundaries = find_chunk_boundaries(f, chunk_num, b"<|endoftext|>")
 
             # The following is a serial implementation, but you can parallelize this
             # by sending each start/end pair to a set of processes.
@@ -285,9 +357,7 @@ class BPETokenizerTrainer:
                 f.seek(start)
                 chunk = f.read(end - start).decode("utf-8", errors="ignore")
                 # Run pre-tokenization on your chunk and store the counts for each pre-token
-                chunk_list.append(chunk)
-
-        return chunk_list
+                yield chunk
 
 
 class BPETokenizer:
@@ -328,12 +398,18 @@ class BPETokenizer:
                     self.vocab_reverse[encoded_token] = max_token_id
 
         self.pre_tokenize_re = regex.compile(self.PAT)
+        self.time_statistics = defaultdict(int)
+
+        self.merge_dict = {merge: i for i, merge in enumerate(self.merges)}
 
     @staticmethod
-    def from_files(
-        cls, vocab_filepath, merges_filepath, special_tokens=None
-    ) -> "BPETokenizer":
-        pass
+    def from_files(file_path, special_tokens=None) -> "BPETokenizer":
+        with open(file_path, "rb") as f:
+            result_dict = pickle.load(f)
+
+        vocab = result_dict["vocab"]
+        merges = result_dict["merges"]
+        return BPETokenizer(vocab, merges, special_tokens)
 
     def pretokenize(self, text: str) -> list[tuple[bytes] | int]:
         result_seq = []
@@ -358,12 +434,142 @@ class BPETokenizer:
 
         return result_seq
 
-    def tokenize(self, byte_sequence: tuple[bytes]) -> list[int]:
+    def tokenize_v3(self, byte_sequence: tuple[bytes]) -> list[int]:
+        pair_set = defaultdict(int)
+        for i in range(len(byte_sequence) - 1):
+            pair_set[(byte_sequence[i], byte_sequence[i + 1])] += 1
+
+        def remove_pair(pair):
+            cnt = pair_set.get(pair)
+            if cnt is None:
+                return
+            elif cnt == 1:
+                del pair_set[pair]
+            else:
+                pair_set[pair] -= 1
+
+        heap = []
+
+        def add_pair_to_heap(pair):
+            # only insert valid pair
+            rank = self.merge_dict.get(pair)
+            if rank is not None:
+                heapq.heappush(heap, (rank, pair))
+
+        for pair in pair_set.keys():
+            add_pair_to_heap(pair)
+
+        while heap:
+            rank, merge = heapq.heappop(heap)
+            if merge not in pair_set:
+                continue
+
+            index = 0
+            old_change_position = []
+            new_change_position = []
+            new_sequence = []
+            while index < len(byte_sequence):
+                if (index < len(byte_sequence) - 1) and (
+                    byte_sequence[index],
+                    byte_sequence[index + 1],
+                ) == merge:
+                    old_change_position.append(index)
+                    new_change_position.append(len(new_sequence))
+                    new_sequence.append(byte_sequence[index] + byte_sequence[index + 1])
+                    index += 2
+                else:
+                    new_sequence.append(byte_sequence[index])
+                    index += 1
+            new_sequence = tuple(new_sequence)
+
+            # calc changed pair
+            # for every pair, change index - 1, index, index + 1
+            for index in old_change_position:
+                remove_pair((byte_sequence[index], byte_sequence[index + 1]))
+                if index > 0:
+                    remove_pair((byte_sequence[index - 1], byte_sequence[index]))
+                if index + 2 < len(byte_sequence):
+                    remove_pair((byte_sequence[index + 1], byte_sequence[index + 2]))
+
+            for index in new_change_position:
+                if index > 0:
+                    pair_set[(new_sequence[index - 1], new_sequence[index])] += 1
+                    add_pair_to_heap((new_sequence[index - 1], new_sequence[index]))
+                if index + 1 < len(new_sequence) and (
+                    new_sequence[index] != new_sequence[index + 1]
+                ):
+                    pair_set[(new_sequence[index], new_sequence[index + 1])] += 1
+                    add_pair_to_heap((new_sequence[index], new_sequence[index + 1]))
+
+            byte_sequence = new_sequence
+
+        return [self.vocab_reverse[bytes] for bytes in byte_sequence]
+
+    def tokenize_v2(self, byte_sequence: tuple[bytes]) -> list[int]:
+        pair_set = defaultdict(int)
+        for i in range(len(byte_sequence) - 1):
+            pair_set[(byte_sequence[i], byte_sequence[i + 1])] += 1
+
+        def remove_pair(pair):
+            pair_set[pair] -= 1
+            if pair_set[pair] == 0:
+                del pair_set[pair]
+
         for merge in self.merges:
+            if merge not in pair_set:
+                continue
+
+            print(f"merge: {merge}")
+            print(pair_set)
+
+            index = 0
+            old_change_position = []
+            new_change_position = []
+            new_sequence = []
+            while index < len(byte_sequence):
+                if (index < len(byte_sequence) - 1) and (
+                    byte_sequence[index],
+                    byte_sequence[index + 1],
+                ) == merge:
+                    old_change_position.append(index)
+                    new_change_position.append(len(new_sequence))
+                    new_sequence.append(byte_sequence[index] + byte_sequence[index + 1])
+                    index += 2
+                else:
+                    new_sequence.append(byte_sequence[index])
+                    index += 1
+            new_sequence = tuple(new_sequence)
+
+            # calc changed pair
+            # for every pair, change index - 1, index, index + 1
+            for index in old_change_position:
+                remove_pair((byte_sequence[index], byte_sequence[index + 1]))
+                if index > 0:
+                    remove_pair((byte_sequence[index - 1], byte_sequence[index]))
+                if index + 2 < len(byte_sequence):
+                    remove_pair((byte_sequence[index + 1], byte_sequence[index + 2]))
+            for index in new_change_position:
+                if index > 0:
+                    pair_set[(new_sequence[index - 1], new_sequence[index])] += 1
+                if index + 1 < len(new_sequence) and (
+                    new_sequence[index] != new_sequence[index + 1]
+                ):
+                    pair_set[(new_sequence[index], new_sequence[index + 1])] += 1
+
+            byte_sequence = new_sequence
+        return [self.vocab_reverse[bytes] for bytes in byte_sequence]
+
+    def tokenize(self, byte_sequence: tuple[bytes]) -> list[int]:
+        bytes_set = set(byte_sequence)
+        for merge in self.merges:
+            if (merge[0] not in bytes_set) or (merge[1] not in bytes_set):
+                continue
+
             new_sequence = []
 
             index = 0
             found_match: bool = False
+
             while index < len(byte_sequence):
                 if (index < len(byte_sequence) - 1) and (
                     byte_sequence[index],
@@ -383,6 +589,7 @@ class BPETokenizer:
 
             if found_match:
                 byte_sequence = new_sequence
+                bytes_set = set(byte_sequence)
 
         # encode id
         result = []
@@ -400,7 +607,9 @@ class BPETokenizer:
             if isinstance(chunk, int):
                 result.append(chunk)
             else:
-                result.extend(self.tokenize(chunk))
+                # result.extend(self.tokenize(chunk))
+                # result.extend(self.tokenize_v2(chunk))
+                result.extend(self.tokenize_v3(chunk))
         return result
 
     def encode_iterable(self, iterable: Iterable[str]) -> Iterator[int]:
@@ -439,27 +648,71 @@ def train_tiny_stories(process_num: int = 16):
 
     trainer.print_time_statictics()
 
-    with open("result.pkl", "wb") as f:
-        pickle.dump(trainer.vocab, f)  # 任意对象（含 bytes）一步到
+    trainer.save_to("tiny_stories_result.pkl")
 
 
-def train_open_web_text(process_num: int = 16):
-    valid_path = "/Users/bytedance/cs336/assignment1-basics/data/owt_train.txt"
-    train_path = "/Users/bytedance/cs336/assignment1-basics/data/owt_valid.txt"
-    path = valid_path
-    # path = train_path
+def train_open_web_text(process_num: int = 16, chunk_num: int = 128):
+    train_path = "/Users/bytedance/cs336/assignment1-basics/data/owt_train.txt"
+    valid_path = "/Users/bytedance/cs336/assignment1-basics/data/owt_valid.txt"
+    # path = valid_path
+    path = train_path
     vocab_size = 32000
     special_tokens = ["<|endoftext|>"]
 
     trainer = BPETokenizerTrainer(vocab_size=vocab_size, special_tokens=special_tokens)
-    trainer.train_from_scratch(path, process_num)
+    trainer.train_from_scratch(
+        path, process_num, chunk_num=chunk_num, streaming_mode=True
+    )
 
     trainer.print_time_statictics()
 
-    with open("open_web_text_result.pkl", "wb") as f:
-        pickle.dump(trainer.vocab, f)
+    trainer.save_to("open_web_text_result.pkl")
+
+
+def split_and_sample_data(text: str, sample_num: int = 10) -> list[str]:
+    special_tokens: list[str] = ["<|endoftext|>"]
+    split_by_special_re = regex.compile("|".join(map(regex.escape, special_tokens)))
+    chunks = split_by_special_re.split(text)
+    return random.sample(chunks, sample_num)
+
+
+def calc_compression_ratio(dataset_path, tokenizer_path, sample_count=10):
+    tokenizer = BPETokenizer.from_files(tokenizer_path)
+
+    chunks = [
+        chunk for chunk in BPETokenizerTrainer.read_from_path(dataset_path, chunk_num=1)
+    ]
+    sample_docs = split_and_sample_data(chunks[0], sample_count)
+
+    profiler = cProfile.Profile()
+    profiler.enable()
+
+    start_time = time.time()
+    token_length = sum(len(tokenizer.encode(doc)) for doc in sample_docs)
+    end_time = time.time()
+
+    profiler.disable()
+    profiler.dump_stats("profile.out")
+
+    bytes_length = sum(len(doc.encode("utf-8")) for doc in sample_docs)
+
+    print(
+        f"token_length: {token_length}. bytes_length: {bytes_length}. compression_ratio: {token_length / bytes_length}."
+    )
+    print(
+        f"tokenize time {end_time - start_time}. estimate throughput: {bytes_length / (end_time - start_time)} bytes/second"
+    )
+    print(tokenizer.time_statistics)
 
 
 if __name__ == "__main__":
     # train_tiny_stories()
-    train_open_web_text(process_num=4)
+    # train_open_web_text(process_num=8, chunk_num=128)
+
+    calc_compression_ratio(
+        "/Users/bytedance/cs336/assignment1-basics/data/TinyStoriesV2-GPT4-valid.txt",
+        "tiny_stories_result.pkl",
+        sample_count=1000,
+    )
+    # calc_compression_ratio("/Users/bytedance/cs336/assignment1-basics/data/owt_valid.txt", "open_web_text_result.pkl")
+    # calc_compression_ratio("/Users/bytedance/cs336/assignment1-basics/data/owt_valid.txt", "tiny_stories_result.pkl")

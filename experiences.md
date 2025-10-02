@@ -80,3 +80,90 @@ accomplishment
 ![](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20251001201120.png)
 
 encode/decode，写的比较简单。for了一遍所有的merge，一个一个遍历，简单做了一个内存的优化。
+
+然后回去训练OpenWebText的时候发现巨慢，开始猜测可能是每次把所有变化的sequence重新计算导致的，优化了一下好像效果不大。
+
+现在打算针对sequence做一个映射。节省一下内存开销试试
+
+train executed in 0.385936 seconds
+train_from_scratch executed in 0.581723 seconds
+print time statistics
+pre_tokenize 0.19399690628051758
+calc_candidate 9.560585021972656e-05
+calc_occur_dict 0.367572546005249
+优化了一波，和上面对比，就是calc_candidate还是很低的情况下，减少了calc_occur_dict的时间。从2s到了0.3
+
+优化版本的跑了一下tiny story：
+train executed in 7.634798 seconds
+train_from_scratch executed in 64.814331 seconds
+print time statistics
+pre_tokenize 55.75555181503296
+calc_candidate 0.003673553466796875
+calc_occur_dict 7.412535905838013
+优化了一倍
+
+跑open web text的valid数据集：
+train executed in 116.717627 seconds
+train_from_scratch executed in 127.463858 seconds
+print time statistics
+pre_tokenize 10.122822046279907
+calc_candidate 0.014718770980834961
+calc_occur_dict 113.59550547599792
+发现越到后面越快。应该是因为到后面token都是一些长尾，去修改对应的word的时候，数量比较少了。
+
+open web text的train：
+io consumption 12.17251706123352
+pre tokenize 494.73776483535767
+initial calc 33.54381990432739
+train executed in 1840.086841 seconds
+train_from_scratch executed in 2350.292584 seconds
+print time statistics
+pre_tokenize 494.7377610206604
+calc_candidate 0.02803349494934082
+calc_occur_dict 1792.9762513637543
+
+这个在我的mac上跑会直接挂掉，pretokenize要切片一点一点来。最后的瓶颈还是在merge上
+
+![](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20251002123930.png)
+
+最长的是一个乱码一样的字符串
+
+![](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20251002124027.png)
+
+后面也都是一些生僻的字符串了。open web text的词表中就多了很多非ascii的
+
+然后是算compression ratio的：
+
+tiny story：
+token_length: 2258. bytes_length: 9140. compression_ratio: 0.24704595185995623
+open web text:
+token_length: 5397. bytes_length: 22105. compression_ratio: 0.24415290658222122
+换成tiny story的tokenizer
+token_length: 8117. bytes_length: 27366. compression_ratio: 0.2966089307900314
+没有针对性的训练压缩率没有很高了。不过30%也很厉害了。只下降了5%
+
+用tiny story测了一下吞吐，每秒钟只有3k的吞吐，有点太低了。
+token_length: 197656. bytes_length: 804583. compression_ratio: 0.24566266003631695.
+tokenize time 213.52363300323486. estimate throughput: 3768.1215361664936 bytes/second
+
+这里太低了我简单优化了下，加了一个set做了快速过滤，过滤那些不存在的merge
+token_length: 197745. bytes_length: 806078. compression_ratio: 0.2453174506685457.
+tokenize time 48.442100048065186. estimate throughput: 16640.03003998988 bytes/second
+
+又加了一个优化，维护了一个pair set，用来快速判断是否能够走merge
+token_length: 18920. bytes_length: 77802. compression_ratio: 0.24318140921827203.
+tokenize time 5.518702745437622. estimate throughput: 14097.878358155791 bytes/second
+发现吞吐还低了一些，说明单独判断一个byte已经比较高效了
+
+采了一个火焰图发现全都是在判断merge是否能够进行。（判断对应的pair是否存在），现在遍历所有的merge开销过大了。改一个策略就是只遍历我们存在的pair对应的merge。因为已经维护了pair set，这里的问题就是快速从我们的pair set中选出下一个需要merge的。
+我们直接再加一个heap，用来按照merge的顺序，从小到大的从heap中选下次需要merge的pair就行，不需要每次都遍历。
+
+token_length: 192324. bytes_length: 783407. compression_ratio: 0.24549691284351557.
+tokenize time 4.0828869342803955. estimate throughput: 191875.75179278743 bytes/second
+
+加了以后吞吐到了百k级别。先到这里吧，比较大的优化基本上做的差不多了，再往后就是扣内存等一些常数优化了
+
+最后还有一个问题是问为什么用u16存token id好一些。因为这里我们的词表是32k，可以用u16保存，用u8就爆了，用u32浪费。
+不过不确定这里的u16的值域是否在设置词表大小的时候被考虑到了，还是说主要考虑的还是词表太大可能影响训练。
+* 这块问了下GPT说其实没有考虑词表大小对存储空间的影响，还是为了压缩率考虑的。感觉应该看看这些tokenize是不是有什么survey，看GPT说是根据压缩率选词表大小，有32k, 50k的。
+  * 说到这里，应该还有一个比较常见的是xxx_100k，这种自然就用不了u16了
