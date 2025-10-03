@@ -128,6 +128,7 @@ class RoPE(torch.nn.Module):
 
         self.construct_cache()
 
+    # TODO: optimize init process
     def construct_cache(self):
         cache = torch.empty((self.max_seq_len, self.d_k // 2, 2, 2))
         for i in range(self.max_seq_len):
@@ -164,3 +165,99 @@ class RoPE(torch.nn.Module):
 
         result = einsum(reshape_x, rotate_mat, "... n1 j, ... n1 i j-> ... n1 i")
         return result.reshape(*x.shape)
+
+
+def softmax(x: Float[Tensor, " ..."], dim: int) -> Float[Tensor, " ..."]:
+    max = torch.max(x, dim=dim, keepdim=True).values
+    x = torch.sub(x, max)
+    exp = torch.exp(x)
+    sum = torch.sum(exp, dim=dim, keepdim=True)
+    return exp / sum
+
+
+def scaled_dot_product_attention(
+    Q: Float[Tensor, " ... queries d_k"],
+    K: Float[Tensor, " ... keys d_k"],
+    V: Float[Tensor, " ... values d_v"],
+    mask: Bool[Tensor, " ... queries keys"] | None = None,
+) -> Float[Tensor, " ... queries d_v"]:
+    d_k = Q.shape[-1]
+    dot_product = einsum(Q, K, "... queries d_k, ... keys d_k -> ... queries keys")
+    # scale dot product
+    dot_product = dot_product / sqrt(d_k)
+
+    if mask is not None:
+        mask_value = torch.where(mask, torch.tensor(0.0), torch.tensor(float("-inf")))
+        dot_product += mask_value
+
+    atten_score = softmax(dot_product, dim=-1)
+    # use atten score to scale feature dimension
+    return einsum(atten_score, V, "... queries keys, ... keys d_v -> ... queries d_v")
+
+
+class MultiHeadSelfAttention(torch.nn.Module):
+    def __init__(self, d_model: int, num_heads: int, max_seq_len: int, theta: float):
+        super().__init__()
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.d_k = self.d_model // self.num_heads
+
+        if max_seq_len != 0:
+            self.rope = RoPE(theta, self.d_k, max_seq_len)
+
+        self.q_proj = Linear(self.d_model, self.d_model)
+        self.k_proj = Linear(self.d_model, self.d_model)
+        self.v_proj = Linear(self.d_model, self.d_model)
+        self.o_proj = Linear(self.d_model, self.d_model)
+
+    def load_weights(
+        self,
+        q_proj_weight: Float[Tensor, " d_k d_in"],
+        k_proj_weight: Float[Tensor, " d_k d_in"],
+        v_proj_weight: Float[Tensor, " d_v d_in"],
+        o_proj_weight: Float[Tensor, " d_model d_v"],
+    ):
+        state_dict = {
+            "q_proj.w": q_proj_weight,
+            "k_proj.w": k_proj_weight,
+            "v_proj.w": v_proj_weight,
+            "o_proj.w": o_proj_weight,
+        }
+        self.load_state_dict(state_dict)
+
+    def construct_casual_mask(self, sequence_length: int):
+        mask = torch.triu(
+            torch.ones(sequence_length, sequence_length), diagonal=1
+        ).bool()
+        return ~mask
+
+    def split_heads(
+        self, x: Float[Tensor, " ... sequence_length d_in"]
+    ) -> Float[Tensor, " ... head sequence_length d_k"]:
+        new_shape = x.shape[:-1] + (self.num_heads, self.d_k)
+        return x.view(new_shape).transpose(-2, -3)
+
+    def combine_heads(
+        self, x: Float[Tensor, " ... head sequence_length d_k"]
+    ) -> Float[Tensor, " ... sequence_length d_out"]:
+        return x.transpose(-2, -3).flatten(start_dim=-2)
+
+    def forward(
+        self,
+        x: Float[Tensor, " ... sequence_length d_in"],
+        token_positions: Int[Tensor, " ... sequence_length"] | None = None,
+    ) -> Float[Tensor, " ... sequence_length d_out"]:
+        q_proj = self.split_heads(self.q_proj.forward(x))
+        k_proj = self.split_heads(self.k_proj.forward(x))
+        v_proj = self.split_heads(self.v_proj.forward(x))
+
+        if token_positions is not None:
+            q_proj = self.rope.forward(q_proj, token_positions)
+            k_proj = self.rope.forward(k_proj, token_positions)
+
+        sequence_length = x.shape[-2]
+        casual_mask = self.construct_casual_mask(sequence_length)
+
+        attention = scaled_dot_product_attention(q_proj, k_proj, v_proj, casual_mask)
+        attention = self.combine_heads(attention)
+        return self.o_proj.forward(attention)
