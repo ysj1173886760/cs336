@@ -225,7 +225,7 @@ class MultiHeadSelfAttention(torch.nn.Module):
         }
         self.load_state_dict(state_dict)
 
-    def construct_casual_mask(self, sequence_length: int):
+    def construct_causal_mask(self, sequence_length: int):
         mask = torch.triu(
             torch.ones(sequence_length, sequence_length), diagonal=1
         ).bool()
@@ -247,6 +247,8 @@ class MultiHeadSelfAttention(torch.nn.Module):
         x: Float[Tensor, " ... sequence_length d_in"],
         token_positions: Int[Tensor, " ... sequence_length"] | None = None,
     ) -> Float[Tensor, " ... sequence_length d_out"]:
+        # 先把每一个token从d_model投影到d_k上，然后再拼接成一个大的d_model
+        # 等价于直接投影到d_model上，再去拆分。因为投影每一个d_k是独立的 
         q_proj = self.split_heads(self.q_proj.forward(x))
         k_proj = self.split_heads(self.k_proj.forward(x))
         v_proj = self.split_heads(self.v_proj.forward(x))
@@ -256,8 +258,9 @@ class MultiHeadSelfAttention(torch.nn.Module):
             k_proj = self.rope.forward(k_proj, token_positions)
 
         sequence_length = x.shape[-2]
-        casual_mask = self.construct_casual_mask(sequence_length)
+        causal_mask = self.construct_causal_mask(sequence_length)
 
-        attention = scaled_dot_product_attention(q_proj, k_proj, v_proj, casual_mask)
+        # 必须要先split head再去算attention，否则算的时候会把整个d_model都用来算atten score，就没有多头了
+        attention = scaled_dot_product_attention(q_proj, k_proj, v_proj, causal_mask)
         attention = self.combine_heads(attention)
         return self.o_proj.forward(attention)
