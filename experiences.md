@@ -179,3 +179,129 @@ tokenize time 4.0828869342803955. estimate throughput: 191875.75179278743 bytes/
 有一个比较坑的需要注意一下，就是在写TransformerBlock的时候，如果你感觉自己写的没啥问题，其他模块也都测试过了，但是还是过不了。它这里需要我们自己生成token position，文档里应该没有显示说明这一点，我最后还是看网上其他人的写法才发现了这个坑点。
 
 可能也是我不太熟悉，不知道具体应该在哪里传入token position。其实课上教授也说了用了RoPE之后是每个transformer block内部加token position了
+
+## Resource accounting
+
+A(m x n), B(n x p)的矩阵乘法需要 2mnp FLOPS
+
+Embedding:
+* 主要是查表，应该不算mat mul
+
+RMSNorm:
+* 对于每一个向量，d次乘法/加法，用来计算rms。然后d次除法除rms，再乘上weight，也是d次
+* 一个向量就是4D次。n个就是4 * N * D次
+* 不过实际上没有matmul
+
+Linear:
+* 就是matmul，2mnp，需要看输入的长度
+
+SwiGLU:
+* 3个matmul，假设输入的数据为(seq_length, d_model)，那么计算量为6 * seq_length * d_model * d_ff
+* 这里我们假设d_ff 是3/8的d_model，那么总共就是16 * seq_length * d_model * d_model
+
+RoPE:
+* 2*2的矩阵相互乘flops是2 * 2 * 2 * 2 = 8
+* 假设输入是(seq_len, d_model), 计算量为8 * (d / 2) * seq_len = 4 * d * seq_len 
+
+Attention:
+* QKV都是 (seq_length, d_k)
+* QK是(2 * seq_length * seq_length * d_k)
+* score * V的计算量是(2 * seq_length * seq_length * d_k)
+* 总共是4 * seq_length * seq_length * d_k
+
+MultiHeadSelfAttention:
+* projection: 3 * (2 * seq_length * d_model * d_model) = 6 * seq_length * d_model * d_model
+* attention: 4 * seq_len * seq_len * ((d_k * head) = d_model)
+* rope: 8 * d_model * seq_len (2个RoPE)
+* 最后一个projection: 2 * seq_len * d_model * d_model
+* 总共是: 8 * seq_len * d_model * d_model + 4 * seq_len * seq_len * d_model + RoPE（太小了不想算
+
+TransformerBlock:
+* attention + ffn
+* 24 * seq_len * d_model * d_model + 4 * seq_len * seq_len * d_model
+* 如果不把上面的d_ff代换过去的话，就是：4 * seq_len * seq_len * d_model + 8 * seq_len * d_model * d_model + 6 * seq_len * d_model * d_ff
+
+TransformerLM:
+应该可以看出来被transformer block中的attention占据主导了，num_layer * TransformerBlock
+
+然后看参数量：
+Embedding:
+* vocab_size * d_model
+
+RMSNorm:
+* d_model
+
+FFN:
+* 3 * d_ff * d_model
+
+RoPE:
+缓存的就先不算了
+
+MultiHeadSelfAttention:
+* d_model * d_model * 4
+
+TransformerBLock:
+* d_model * d_model * 4 + 3 * d_ff * d_model
+
+然后是问答环节：
+
+Suppose we constructed our model using this configuration. How many trainable parameters would our model have? Assuming each parameter is represented using single-precision floating point, how much memory is required to just load this model?
+
+把上面的参数带入进去算：
+* vocab_size * d_model = 80411200
+* num_layer * (d_model * d_model * 4 + 3 * d_ff * d_model) = num_layer * (10240000 + 30720000) = 1966080000
+* lm_head = d_model * vocab_size = 80411200 
+
+总共是2126902400, float32就是7.923328876495361 G
+
+写了一个脚本，再resource_account.py中：
+
+embedding_layer: 306.7MB
+lm_head: 306.7MB
+single_transformer_block: 156.2MB
+total_transformer_block: 7.3GB
+total_size: 7.9GB
+
+Identify the matrix multiplies required to complete a forward pass of our GPT-2 XL-shaped model. How many FLOPs do these matrix multiplies require in total? Assume that our input sequence has context_length tokens.
+
+ffn: 3.020e+12
+attn_dot_product: 3.221e+11
+attn_proj: 1.007e+12
+total: 4.349e+12
+
+这里d_model/d_ff比较大，同时context length比较小，所以主导的是FFN
+
+gpt2_small
+ffn: 1.739e+11 64.29%
+attn_dot_product: 3.865e+10. 14.29%
+attn_proj: 5.798e+10 21.43%
+total: 2.706e+11
+
+gpt2_medium
+ffn: 6.185e+11 66.67%
+attn_dot_product: 1.031e+11. 11.11%
+attn_proj: 2.062e+11 22.22%
+total: 9.277e+11
+
+gpt2_large
+ffn: 1.450e+12 68.18%
+attn_dot_product: 1.933e+11. 9.09%
+attn_proj: 4.832e+11 22.73%
+total: 2.126e+12
+
+gpt2_xl
+ffn: 3.020e+12 69.44%
+attn_dot_product: 3.221e+11. 7.41%
+attn_proj: 1.007e+12 23.15%
+total: 4.349e+12
+
+占据主导的始终是ffn，随着模型规模变大，ffn的比例也在提高。
+这是因为模型规模和d_model相关，随d_model的平方正比，而attn则是跟着seq_length走
+
+gpt2_xl_long
+ffn: 4.832e+13 32.89%
+attn_dot_product: 8.246e+13. 56.14%
+attn_proj: 1.611e+13 10.96%
+total: 1.469e+14
+
+扩大上下文长度后，flops上升了两个量级。attn占比上升了很多
