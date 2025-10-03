@@ -80,3 +80,29 @@ class RMSNorm(torch.nn.Module):
 
         result = x / rms * self.gain
         return result.to(dtype=in_dtype)
+
+class FFNSwiGLU(torch.nn.Module):
+    def __init__(self, d_model: int, d_ff: int, device=None, dtype=None):
+      super().__init__()
+      self.w1 = Linear(in_features=d_model, out_features=d_ff, device=device, dtype=dtype)
+      self.w2 = Linear(in_features=d_ff, out_features=d_model, device=device, dtype=dtype)
+      self.w3 = Linear(in_features=d_model, out_features=d_ff, device=device, dtype=dtype)
+    
+    def load_weights(self,
+      w1_weight: Float[Tensor, " d_ff d_model"],
+      w2_weight: Float[Tensor, " d_model d_ff"],
+      w3_weight: Float[Tensor, " d_ff d_model"]):
+
+      # nn.Module/nn.Parameter will get registered in self._parameters
+      state_dict = {"w1.w": w1_weight, "w2.w": w2_weight, "w3.w": w3_weight}
+      self.load_state_dict(state_dict)
+
+    def silu(self, x: Float[Tensor, " ... d_ff"]):
+      # element wise
+      return torch.sigmoid(x) * x
+
+    def forward(self, x: Float[Tensor, " ... d_model"]) -> Float[Tensor, " ... d_model"]:
+      silu_res = self.silu(self.w1.forward(x))
+      gate_res = silu_res * self.w3.forward(x)
+      return self.w2.forward(gate_res)
+  
