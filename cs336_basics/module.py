@@ -1,5 +1,5 @@
 import torch
-from math import sqrt
+from math import sqrt, cos, sin
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
 from einops import einsum, rearrange
@@ -55,6 +55,7 @@ class Embedding(torch.nn.Module):
         result = torch.index_select(self.w, 0, input_flat)
         return result.reshape((*token_ids.shape, -1))
 
+
 class RMSNorm(torch.nn.Module):
     def __init__(self, d_model: int, eps: float = 1e-5, device=None, dtype=None):
         super().__init__()
@@ -62,47 +63,104 @@ class RMSNorm(torch.nn.Module):
         self.d_model = d_model
         self.eps = eps
 
-        init_data = torch.ones((d_model, ), **factory_kwargs)
+        init_data = torch.ones((d_model,), **factory_kwargs)
         self.gain = torch.nn.Parameter(init_data)
-    
+
     def load_weights(self, weights: Float[Tensor, "d_model"]):
         state_dict = {"gain": weights}
         self.load_state_dict(state_dict)
-    
+
     def forward(self, x: Float[Tensor, "... d_model"]):
         in_dtype = x.dtype
         x = x.to(torch.float32)
 
         # batch_size, d_model -> batch_size
-        rms = torch.sqrt(torch.sum(x ** 2, dim=-1) / self.d_model + self.eps)
+        rms = torch.sqrt(torch.sum(x**2, dim=-1) / self.d_model + self.eps)
         # reshape to (..., 1). since we are doing vector-wise division
         rms = rms.reshape(*rms.shape, 1)
 
         result = x / rms * self.gain
         return result.to(dtype=in_dtype)
 
+
 class FFNSwiGLU(torch.nn.Module):
     def __init__(self, d_model: int, d_ff: int, device=None, dtype=None):
-      super().__init__()
-      self.w1 = Linear(in_features=d_model, out_features=d_ff, device=device, dtype=dtype)
-      self.w2 = Linear(in_features=d_ff, out_features=d_model, device=device, dtype=dtype)
-      self.w3 = Linear(in_features=d_model, out_features=d_ff, device=device, dtype=dtype)
-    
-    def load_weights(self,
-      w1_weight: Float[Tensor, " d_ff d_model"],
-      w2_weight: Float[Tensor, " d_model d_ff"],
-      w3_weight: Float[Tensor, " d_ff d_model"]):
+        super().__init__()
+        self.w1 = Linear(
+            in_features=d_model, out_features=d_ff, device=device, dtype=dtype
+        )
+        self.w2 = Linear(
+            in_features=d_ff, out_features=d_model, device=device, dtype=dtype
+        )
+        self.w3 = Linear(
+            in_features=d_model, out_features=d_ff, device=device, dtype=dtype
+        )
 
-      # nn.Module/nn.Parameter will get registered in self._parameters
-      state_dict = {"w1.w": w1_weight, "w2.w": w2_weight, "w3.w": w3_weight}
-      self.load_state_dict(state_dict)
+    def load_weights(
+        self,
+        w1_weight: Float[Tensor, " d_ff d_model"],
+        w2_weight: Float[Tensor, " d_model d_ff"],
+        w3_weight: Float[Tensor, " d_ff d_model"],
+    ):
+
+        # nn.Module/nn.Parameter will get registered in self._parameters
+        state_dict = {"w1.w": w1_weight, "w2.w": w2_weight, "w3.w": w3_weight}
+        self.load_state_dict(state_dict)
 
     def silu(self, x: Float[Tensor, " ... d_ff"]):
-      # element wise
-      return torch.sigmoid(x) * x
+        # element wise
+        return torch.sigmoid(x) * x
 
-    def forward(self, x: Float[Tensor, " ... d_model"]) -> Float[Tensor, " ... d_model"]:
-      silu_res = self.silu(self.w1.forward(x))
-      gate_res = silu_res * self.w3.forward(x)
-      return self.w2.forward(gate_res)
-  
+    def forward(
+        self, x: Float[Tensor, " ... d_model"]
+    ) -> Float[Tensor, " ... d_model"]:
+        silu_res = self.silu(self.w1.forward(x))
+        gate_res = silu_res * self.w3.forward(x)
+        return self.w2.forward(gate_res)
+
+
+class RoPE(torch.nn.Module):
+    def __init__(self, theta: float, d_k: int, max_seq_len: int):
+        super().__init__()
+        self.d_k = d_k
+        self.theta = theta
+        self.max_seq_len = max_seq_len
+
+        self.construct_cache()
+
+    def construct_cache(self):
+        cache = torch.empty((self.max_seq_len, self.d_k // 2, 2, 2))
+        for i in range(self.max_seq_len):
+            for k in range(self.d_k // 2):
+                cache[i][k] = self.get_block_mat(i, k)
+        self.register_buffer("rotate_mat", cache, persistent=False)
+
+    def calc_angle(self, position, k):
+        return position / (self.theta ** ((2 * k) / self.d_k))
+
+    def get_block_mat(self, position: int, k: int) -> Tensor:
+        return torch.tensor(
+            [
+                cos(self.calc_angle(position, k)),
+                -sin(self.calc_angle(position, k)),
+                sin(self.calc_angle(position, k)),
+                cos(self.calc_angle(position, k)),
+            ]
+        ).reshape((2, 2))
+
+    def forward(
+        self,
+        x: Float[Tensor, " ... sequence_length d_k"],
+        token_positions: Int[Tensor, " ... sequence_length"],
+    ) -> Float[Tensor, " ... sequence_length d_k"]:
+        n1 = self.d_k // 2
+        n2 = 2
+        reshape_x = rearrange(
+            x, "... sequence_length (n1 n2)-> ... sequence_length n1 n2", n1=n1, n2=n2
+        )
+
+        # ..., d / k, 2, 2
+        rotate_mat = self.rotate_mat[token_positions]
+
+        result = einsum(reshape_x, rotate_mat, "... n1 j, ... n1 i j-> ... n1 i")
+        return result.reshape(*x.shape)

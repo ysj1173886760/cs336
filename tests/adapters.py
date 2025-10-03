@@ -10,7 +10,7 @@ from jaxtyping import Bool, Float, Int
 from torch import Tensor
 from cs336_basics.bpe_tokenizer import BPETokenizerTrainer, BPETokenizer
 
-from cs336_basics.module import Linear, Embedding, RMSNorm, FFNSwiGLU
+from cs336_basics.module import Linear, Embedding, RMSNorm, FFNSwiGLU, RoPE
 
 
 def run_linear(
@@ -209,7 +209,8 @@ def run_rope(
     Returns:
         Float[Tensor, " ... sequence_length d_k"]: Tensor with RoPEd input.
     """
-    raise NotImplementedError
+    rope = RoPE(theta, d_k, max_seq_len)
+    return rope.forward(in_query_or_key, token_positions)
 
 
 def run_transformer_block(
@@ -390,6 +391,7 @@ def run_rmsnorm(
     rms_norm = RMSNorm(d_model, eps)
     rms_norm.load_weights(weights)
     return rms_norm.forward(in_features)
+
 
 def run_silu(in_features: Float[Tensor, " ..."]) -> Float[Tensor, " ..."]:
     """Given a tensor of inputs, return the output of applying SiLU
