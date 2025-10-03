@@ -18,14 +18,14 @@ class Linear(torch.nn.Module):
         a = -3 * std
         b = 3 * std
         torch.nn.init.trunc_normal_(init_data, mean=mean, std=std, a=a, b=b)
-        self.w = torch.nn.Parameter(init_data)
+        self.weight = torch.nn.Parameter(init_data)
 
     def load_weights(self, weights: Float[Tensor, "d_out d_in"]):
-        state_dict = {"w": weights}
+        state_dict = {"weight": weights}
         self.load_state_dict(state_dict)
 
     def forward(self, x: Float[Tensor, "... d_in"]) -> torch.Tensor:
-        return einsum(self.w, x, "d_out d_in, ... d_in -> ... d_out")
+        return einsum(self.weight, x, "d_out d_in, ... d_in -> ... d_out")
 
 
 class Embedding(torch.nn.Module):
@@ -43,16 +43,16 @@ class Embedding(torch.nn.Module):
         std = 1
         a, b = -3, 3
         torch.nn.init.trunc_normal_(init_data, mean, std, a, b)
-        self.w = torch.nn.Parameter(init_data)
+        self.weight = torch.nn.Parameter(init_data)
 
     def load_weights(self, weights: Float[Tensor, "vocab_size d_model"]):
-        state_dict = {"w": weights}
+        state_dict = {"weight": weights}
         self.load_state_dict(state_dict)
 
     def forward(self, token_ids: Int[Tensor, "..."]):
         input_flat = token_ids.reshape(-1)
         # select embedding at dimension 0
-        result = torch.index_select(self.w, 0, input_flat)
+        result = torch.index_select(self.weight, 0, input_flat)
         return result.reshape((*token_ids.shape, -1))
 
 
@@ -64,10 +64,10 @@ class RMSNorm(torch.nn.Module):
         self.eps = eps
 
         init_data = torch.ones((d_model,), **factory_kwargs)
-        self.gain = torch.nn.Parameter(init_data)
+        self.weight = torch.nn.Parameter(init_data)
 
     def load_weights(self, weights: Float[Tensor, "d_model"]):
-        state_dict = {"gain": weights}
+        state_dict = {"weight": weights}
         self.load_state_dict(state_dict)
 
     def forward(self, x: Float[Tensor, "... d_model"]):
@@ -79,7 +79,7 @@ class RMSNorm(torch.nn.Module):
         # reshape to (..., 1). since we are doing vector-wise division
         rms = rms.reshape(*rms.shape, 1)
 
-        result = x / rms * self.gain
+        result = x / rms * self.weight
         return result.to(dtype=in_dtype)
 
 
@@ -104,7 +104,11 @@ class FFNSwiGLU(torch.nn.Module):
     ):
 
         # nn.Module/nn.Parameter will get registered in self._parameters
-        state_dict = {"w1.w": w1_weight, "w2.w": w2_weight, "w3.w": w3_weight}
+        state_dict = {
+            "w1.weight": w1_weight,
+            "w2.weight": w2_weight,
+            "w3.weight": w3_weight,
+        }
         self.load_state_dict(state_dict)
 
     def silu(self, x: Float[Tensor, " ... d_ff"]):
@@ -208,7 +212,7 @@ class MultiHeadSelfAttention(torch.nn.Module):
         self.q_proj = Linear(self.d_model, self.d_model)
         self.k_proj = Linear(self.d_model, self.d_model)
         self.v_proj = Linear(self.d_model, self.d_model)
-        self.o_proj = Linear(self.d_model, self.d_model)
+        self.output_proj = Linear(self.d_model, self.d_model)
 
     def load_weights(
         self,
@@ -218,10 +222,10 @@ class MultiHeadSelfAttention(torch.nn.Module):
         o_proj_weight: Float[Tensor, " d_model d_v"],
     ):
         state_dict = {
-            "q_proj.w": q_proj_weight,
-            "k_proj.w": k_proj_weight,
-            "v_proj.w": v_proj_weight,
-            "o_proj.w": o_proj_weight,
+            "q_proj.weight": q_proj_weight,
+            "k_proj.weight": k_proj_weight,
+            "v_proj.weight": v_proj_weight,
+            "output_proj.weight": o_proj_weight,
         }
         self.load_state_dict(state_dict)
 
@@ -248,7 +252,7 @@ class MultiHeadSelfAttention(torch.nn.Module):
         token_positions: Int[Tensor, " ... sequence_length"] | None = None,
     ) -> Float[Tensor, " ... sequence_length d_out"]:
         # 先把每一个token从d_model投影到d_k上，然后再拼接成一个大的d_model
-        # 等价于直接投影到d_model上，再去拆分。因为投影每一个d_k是独立的 
+        # 等价于直接投影到d_model上，再去拆分。因为投影每一个d_k是独立的
         q_proj = self.split_heads(self.q_proj.forward(x))
         k_proj = self.split_heads(self.k_proj.forward(x))
         v_proj = self.split_heads(self.v_proj.forward(x))
@@ -263,4 +267,30 @@ class MultiHeadSelfAttention(torch.nn.Module):
         # 必须要先split head再去算attention，否则算的时候会把整个d_model都用来算atten score，就没有多头了
         attention = scaled_dot_product_attention(q_proj, k_proj, v_proj, causal_mask)
         attention = self.combine_heads(attention)
-        return self.o_proj.forward(attention)
+        return self.output_proj.forward(attention)
+
+
+class TransformerBlock(torch.nn.Module):
+    def __init__(
+        self, d_model: int, num_heads: int, d_ff: int, max_seq_len: int, theta: float
+    ):
+        super().__init__()
+
+        self.attn = MultiHeadSelfAttention(d_model, num_heads, max_seq_len, theta)
+        self.ln1 = RMSNorm(d_model)
+        self.ffn = FFNSwiGLU(d_model, d_ff)
+        self.ln2 = RMSNorm(d_model)
+
+    def load_weights(self, weights: dict):
+        self.load_state_dict(weights)
+
+    def forward(
+        self,
+        x: Float[Tensor, " batch sequence_length d_model"],
+        token_positions: Int[Tensor, " ... sequence_length"] | None = None,
+    ) -> Float[Tensor, " batch sequence_length d_model"]:
+        y = x + self.attn.forward(self.ln1.forward(x), token_positions)
+
+        y2 = y + self.ffn.forward(self.ln2.forward(y))
+
+        return y2

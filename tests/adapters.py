@@ -19,6 +19,7 @@ from cs336_basics.module import (
     softmax,
     scaled_dot_product_attention,
     MultiHeadSelfAttention,
+    TransformerBlock,
 )
 
 
@@ -296,7 +297,13 @@ def run_transformer_block(
         Float[Tensor, "batch sequence_length d_model"] Tensor with the output of
         running the Transformer block on the input features while using RoPE.
     """
-    raise NotImplementedError
+    transformer = TransformerBlock(d_model, num_heads, d_ff, max_seq_len, theta)
+    transformer.load_weights(weights)
+
+    # ?，为什么这里要用token position也没有说一下
+    b, s, d = in_features.shape
+    token_position = torch.arange(s).expand(b, s)
+    return transformer.forward(in_features, token_position)
 
 
 def run_transformer_lm(
@@ -417,7 +424,7 @@ def run_silu(in_features: Float[Tensor, " ..."]) -> Float[Tensor, " ..."]:
         Float[Tensor,"..."]: of with the same shape as `in_features` with the output of applying
         SiLU to each element.
     """
-    raise NotImplementedError
+    return torch.sigmoid(in_features) * in_features
 
 
 def run_get_batch(
