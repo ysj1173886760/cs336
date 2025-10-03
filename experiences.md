@@ -305,3 +305,8 @@ attn_proj: 1.611e+13 10.96%
 total: 1.469e+14
 
 扩大上下文长度后，flops上升了两个量级。attn占比上升了很多
+
+和GPT老师对了下答案应该没啥问题，然后这里还让他给了一下激活值的内存占用，也有一个直观的了解：
+![](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20251003214714.png)
+
+需要注意的是，attention这一层的内存消耗是head * (T**2)，因为这个T * T的矩阵里记录的是softmax的分数，不会乘上d，所以内存主要消耗还是KV Cache的地方
