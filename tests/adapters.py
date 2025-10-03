@@ -301,10 +301,7 @@ def run_transformer_block(
     transformer = TransformerBlock(d_model, num_heads, d_ff, max_seq_len, theta)
     transformer.load_weights(weights)
 
-    # ?，为什么这里要用token position也没有说一下
-    b, s, d = in_features.shape
-    token_position = torch.arange(s).expand(b, s)
-    return transformer.forward(in_features, token_position)
+    return transformer.forward(in_features)
 
 
 def run_transformer_lm(
