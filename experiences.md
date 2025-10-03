@@ -1,7 +1,5 @@
 # Tokenizer
 
-## TrainBPE
-
 tests/test_train_bpe.py::test_train_bpe_speed 1
 pre tokenize 0.022261857986450195
 merges with 243 times, 1.4453072547912598
@@ -169,3 +167,15 @@ tokenize time 4.0828869342803955. estimate throughput: 191875.75179278743 bytes/
   * 说到这里，应该还有一个比较常见的是xxx_100k，这种自然就用不了u16了
   * 一些multi lingual的一般词表都比较大，100k，256k等
 
+
+# Transformer
+
+![](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20251003184742.png)
+
+整体来说难度不大，每一个具体的任务都写明白了接口和具体的公式，跟着写就行。
+
+不过我这里代码比较粗糙的是没有处理device/dtype，这个后面可以通过kwargs一路透传，晚点发现训练瓶颈的时候再加一下。
+
+有一个比较坑的需要注意一下，就是在写TransformerBlock的时候，如果你感觉自己写的没啥问题，其他模块也都测试过了，但是还是过不了。它这里需要我们自己生成token position，文档里应该没有显示说明这一点，我最后还是看网上其他人的写法才发现了这个坑点。
+
+可能也是我不太熟悉，不知道具体应该在哪里传入token position。其实课上教授也说了用了RoPE之后是每个transformer block内部加token position了
