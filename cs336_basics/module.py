@@ -54,3 +54,29 @@ class Embedding(torch.nn.Module):
         # select embedding at dimension 0
         result = torch.index_select(self.w, 0, input_flat)
         return result.reshape((*token_ids.shape, -1))
+
+class RMSNorm(torch.nn.Module):
+    def __init__(self, d_model: int, eps: float = 1e-5, device=None, dtype=None):
+        super().__init__()
+        factory_kwargs = {"device": device, "dtype": dtype}
+        self.d_model = d_model
+        self.eps = eps
+
+        init_data = torch.ones((d_model, ), **factory_kwargs)
+        self.gain = torch.nn.Parameter(init_data)
+    
+    def load_weights(self, weights: Float[Tensor, "d_model"]):
+        state_dict = {"gain": weights}
+        self.load_state_dict(state_dict)
+    
+    def forward(self, x: Float[Tensor, "... d_model"]):
+        in_dtype = x.dtype
+        x = x.to(torch.float32)
+
+        # batch_size, d_model -> batch_size
+        rms = torch.sqrt(torch.sum(x ** 2, dim=-1) / self.d_model + self.eps)
+        # reshape to (..., 1). since we are doing vector-wise division
+        rms = rms.reshape(*rms.shape, 1)
+
+        result = x / rms * self.gain
+        return result.to(dtype=in_dtype)
