@@ -320,3 +320,5 @@ Problem (learning_rate_tuning): Tuning the learning rate
 LR低的时候在逐步收敛了，LR高的时候loss就起飞了
 
 1e1的时候收敛比较慢，1e2的时候收敛比较快，1e3无法收敛
+
+gradient clipping记得是算全局的梯度。

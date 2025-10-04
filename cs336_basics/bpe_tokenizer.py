@@ -13,6 +13,7 @@ from tqdm import tqdm
 import cProfile
 import random
 import heapq
+import numpy as np
 
 
 def timing(func):
@@ -705,14 +706,51 @@ def calc_compression_ratio(dataset_path, tokenizer_path, sample_count=10):
     print(tokenizer.time_statistics)
 
 
+def tokenize_data(data_path, tokenizer_path, output_path):
+    tokenizer = BPETokenizer.from_files(tokenizer_path)
+    chunk_num = 1024
+    batch_size = 16
+    process_num = 9
+
+    def encode_parallel(chunks: list[str]):
+        with ProcessPoolExecutor(max_workers=process_num) as pool:
+            futures = [pool.submit(tokenizer.encode, chunk) for chunk in chunks]
+            for f in as_completed(futures):
+                tokens = f.result()
+                array = np.array(tokens, dtype=np.uint16)
+                final_result.append(array)
+
+    final_result = []
+    chunks = [
+        chunk
+        for chunk in BPETokenizerTrainer.read_from_path(data_path, chunk_num=chunk_num)
+    ]
+
+    for i in tqdm(range(0, len(chunks), batch_size)):
+        encode_parallel(chunks[i : i + batch_size])
+
+    final_result = np.concatenate(final_result)
+    np.save(output_path, final_result)
+
+
 if __name__ == "__main__":
     # train_tiny_stories()
     # train_open_web_text(process_num=8, chunk_num=128)
 
-    calc_compression_ratio(
-        "/Users/bytedance/cs336/assignment1-basics/data/TinyStoriesV2-GPT4-valid.txt",
-        "tiny_stories_result.pkl",
-        sample_count=1000,
-    )
+    # calc_compression_ratio(
+    #     "/Users/bytedance/cs336/assignment1-basics/data/TinyStoriesV2-GPT4-valid.txt",
+    #     "tiny_stories_result.pkl",
+    #     sample_count=1000,
+    # )
     # calc_compression_ratio("/Users/bytedance/cs336/assignment1-basics/data/owt_valid.txt", "open_web_text_result.pkl")
     # calc_compression_ratio("/Users/bytedance/cs336/assignment1-basics/data/owt_valid.txt", "tiny_stories_result.pkl")
+    tokenize_data(
+        "/Users/bytedance/cs336/assignment1-basics/data/TinyStoriesV2-GPT4-train.txt",
+        "tiny_stories_result.pkl",
+        "tiny_stories_train.npy",
+    )
+    tokenize_data(
+        "/Users/bytedance/cs336/assignment1-basics/data/TinyStoriesV2-GPT4-valid.txt",
+        "tiny_stories_result.pkl",
+        "tiny_stories_valid.npy",
+    )

@@ -4,6 +4,10 @@ from jaxtyping import Bool, Float, Int
 from torch import Tensor
 from einops import einsum, rearrange
 from typing import Iterable
+import numpy.typing as npt
+import numpy as np
+from typing import IO, Any, BinaryIO
+import os
 
 
 class Linear(torch.nn.Module):
@@ -165,7 +169,7 @@ class RoPE(torch.nn.Module):
             x, "... sequence_length (n1 n2)-> ... sequence_length n1 n2", n1=n1, n2=n2
         )
 
-        # ..., d / k, 2, 2
+        # batch_size, seq_len, d / k, 2, 2
         rotate_mat = self.rotate_mat[token_positions]
 
         result = einsum(reshape_x, rotate_mat, "... n1 j, ... n1 i j-> ... n1 i")
@@ -259,8 +263,8 @@ class MultiHeadSelfAttention(torch.nn.Module):
         v_proj = self.split_heads(self.v_proj.forward(x))
 
         if token_positions is not None:
-            q_proj = self.rope.forward(q_proj, token_positions)
-            k_proj = self.rope.forward(k_proj, token_positions)
+            q_proj = self.rope.forward(q_proj, token_positions.unsqueeze(1))
+            k_proj = self.rope.forward(k_proj, token_positions.unsqueeze(1))
 
         sequence_length = x.shape[-2]
         causal_mask = self.construct_causal_mask(sequence_length)
@@ -389,23 +393,69 @@ class AdamW(torch.optim.Optimizer):
 
         return loss
 
+
 def get_cos_lr_schedule(t, lr_max, lr_min, t_w, t_c) -> float:
-  if t < t_w:
-    return t / t_w * lr_max
+    if t < t_w:
+        return t / t_w * lr_max
 
-  if t > t_c:
-    return lr_min
+    if t > t_c:
+        return lr_min
 
-  return 0.5 * (1 + cos((t - t_w) / (t_c - t_w) * pi)) * (lr_max - lr_min) + lr_min
+    return 0.5 * (1 + cos((t - t_w) / (t_c - t_w) * pi)) * (lr_max - lr_min) + lr_min
+
 
 def gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm: float):
     eps = 1e-6
     grads = [p.grad for p in parameters if p.grad is not None]
     total_norm = torch.norm(torch.cat(grads), p=2)
 
-    scale_factor = (max_l2_norm / (total_norm + eps))
+    scale_factor = max_l2_norm / (total_norm + eps)
     if scale_factor < 1.0:
-      for p in parameters:
-        if p.grad is None:
-          continue
-        p.grad.mul_(scale_factor)
+        for p in parameters:
+            if p.grad is None:
+                continue
+            p.grad.mul_(scale_factor)
+
+
+def get_batch_data(
+    dataset: npt.NDArray, batch_size: int, context_length: int, device: str
+) -> tuple[torch.Tensor, torch.Tensor]:
+    assert len(dataset) >= context_length + 1
+    indices = np.random.choice(
+        len(dataset) - context_length, size=batch_size, replace=True
+    )
+
+    offsets = np.arange(context_length + 1).reshape(1, -1)
+    idx = indices.reshape(batch_size, 1) + offsets
+
+    window = dataset[idx]
+    x = window[:, :-1]
+    y = window[:, 1:]
+    x = torch.from_numpy(x).to(device=device, dtype=torch.long)
+    y = torch.from_numpy(y).to(device=device, dtype=torch.long)
+    return x, y
+
+
+def save_checkpoint(
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    iteration: int,
+    out: str | os.PathLike | BinaryIO | IO[bytes],
+):
+    dict = {
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "iteration": iteration,
+    }
+    torch.save(dict, out)
+
+
+def load_checkpoint(
+    src: str | os.PathLike | BinaryIO | IO[bytes],
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+) -> int:
+    dict = torch.load(src)
+    model.load_state_dict(dict["model"])
+    optimizer.load_state_dict(dict["optimizer"])
+    return dict["iteration"]
