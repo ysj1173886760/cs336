@@ -17,7 +17,9 @@ class Linear(torch.nn.Module):
         self.in_features = in_features
         self.out_features = out_features
 
-        init_data = torch.empty((out_features, in_features), device=device, dtype=dtype)
+        factory_kwargs = {"device": device, "dtype": dtype}
+
+        init_data = torch.empty((out_features, in_features), **factory_kwargs)
         mean = 0
         std = sqrt(2 / (out_features + in_features))
         a = -3 * std
@@ -129,17 +131,22 @@ class FFNSwiGLU(torch.nn.Module):
 
 
 class RoPE(torch.nn.Module):
-    def __init__(self, theta: float, d_k: int, max_seq_len: int):
+    def __init__(
+        self, theta: float, d_k: int, max_seq_len: int, device=None, dtype=None
+    ):
         super().__init__()
         self.d_k = d_k
         self.theta = theta
         self.max_seq_len = max_seq_len
+        self.factory_kwargs = {"device": device, "dtype": dtype}
 
         self.construct_cache()
 
     # TODO: optimize init process
     def construct_cache(self):
-        cache = torch.empty((self.max_seq_len, self.d_k // 2, 2, 2))
+        cache = torch.empty(
+            (self.max_seq_len, self.d_k // 2, 2, 2), **self.factory_kwargs
+        )
         for i in range(self.max_seq_len):
             for k in range(self.d_k // 2):
                 cache[i][k] = self.get_block_mat(i, k)
@@ -155,7 +162,8 @@ class RoPE(torch.nn.Module):
                 -sin(self.calc_angle(position, k)),
                 sin(self.calc_angle(position, k)),
                 cos(self.calc_angle(position, k)),
-            ]
+            ],
+            **self.factory_kwargs
         ).reshape((2, 2))
 
     def forward(
@@ -195,8 +203,16 @@ def scaled_dot_product_attention(
     # scale dot product
     dot_product = dot_product / sqrt(d_k)
 
+    device = Q.device
+    dtype = Q.dtype
+    factory_kwargs = {"device": device, "dtype": dtype}
+
     if mask is not None:
-        mask_value = torch.where(mask, torch.tensor(0.0), torch.tensor(float("-inf")))
+        mask_value = torch.where(
+            mask,
+            torch.tensor(0.0, **factory_kwargs),
+            torch.tensor(float("-inf"), **factory_kwargs),
+        )
         dot_product += mask_value
 
     atten_score = softmax(dot_product, dim=-1)
@@ -205,19 +221,30 @@ def scaled_dot_product_attention(
 
 
 class MultiHeadSelfAttention(torch.nn.Module):
-    def __init__(self, d_model: int, num_heads: int, max_seq_len: int, theta: float):
+    def __init__(
+        self,
+        d_model: int,
+        num_heads: int,
+        max_seq_len: int,
+        theta: float,
+        device=None,
+        dtype=None,
+    ):
         super().__init__()
         self.d_model = d_model
         self.num_heads = num_heads
         self.d_k = self.d_model // self.num_heads
+        self.factory_kwargs = {"device": device, "dtype": dtype}
 
         if max_seq_len != 0:
-            self.rope = RoPE(theta, self.d_k, max_seq_len)
+            self.rope = RoPE(theta, self.d_k, max_seq_len, device=device, dtype=dtype)
 
-        self.q_proj = Linear(self.d_model, self.d_model)
-        self.k_proj = Linear(self.d_model, self.d_model)
-        self.v_proj = Linear(self.d_model, self.d_model)
-        self.output_proj = Linear(self.d_model, self.d_model)
+        self.q_proj = Linear(self.d_model, self.d_model, device=device, dtype=dtype)
+        self.k_proj = Linear(self.d_model, self.d_model, device=device, dtype=dtype)
+        self.v_proj = Linear(self.d_model, self.d_model, device=device, dtype=dtype)
+        self.output_proj = Linear(
+            self.d_model, self.d_model, device=device, dtype=dtype
+        )
 
     def load_weights(
         self,
@@ -236,7 +263,8 @@ class MultiHeadSelfAttention(torch.nn.Module):
 
     def construct_causal_mask(self, sequence_length: int):
         mask = torch.triu(
-            torch.ones(sequence_length, sequence_length), diagonal=1
+            torch.ones(sequence_length, sequence_length, **self.factory_kwargs),
+            diagonal=1,
         ).bool()
         return ~mask
 
@@ -277,14 +305,23 @@ class MultiHeadSelfAttention(torch.nn.Module):
 
 class TransformerBlock(torch.nn.Module):
     def __init__(
-        self, d_model: int, num_heads: int, d_ff: int, max_seq_len: int, theta: float
+        self,
+        d_model: int,
+        num_heads: int,
+        d_ff: int,
+        max_seq_len: int,
+        theta: float,
+        device=None,
+        dtype=None,
     ):
         super().__init__()
-
-        self.attn = MultiHeadSelfAttention(d_model, num_heads, max_seq_len, theta)
-        self.ln1 = RMSNorm(d_model)
-        self.ffn = FFNSwiGLU(d_model, d_ff)
-        self.ln2 = RMSNorm(d_model)
+        self.factory_kwargs = {"device": device, "dtype": dtype}
+        self.attn = MultiHeadSelfAttention(
+            d_model, num_heads, max_seq_len, theta, device=device, dtype=dtype
+        )
+        self.ln1 = RMSNorm(d_model, device=device, dtype=dtype)
+        self.ffn = FFNSwiGLU(d_model, d_ff, device=device, dtype=dtype)
+        self.ln2 = RMSNorm(d_model, device=device, dtype=dtype)
 
     def load_weights(self, weights: dict):
         self.load_state_dict(weights)
@@ -294,7 +331,7 @@ class TransformerBlock(torch.nn.Module):
         x: Float[Tensor, " batch sequence_length d_model"],
     ) -> Float[Tensor, " batch sequence_length d_model"]:
         b, s, _ = x.shape
-        token_position = torch.arange(s).expand(b, s)
+        token_position = torch.arange(s, device=x.device, dtype=torch.long).expand(b, s)
 
         y = x + self.attn.forward(self.ln1.forward(x), token_position)
 
@@ -313,18 +350,30 @@ class TransformerLM(torch.nn.Module):
         num_heads: int,
         d_ff: int,
         rope_theta: float,
+        device=None,
+        dtype=None,
     ):
         super().__init__()
 
         self.layers = torch.nn.ModuleList()
         for i in range(num_layers):
             self.layers.append(
-                TransformerBlock(d_model, num_heads, d_ff, context_length, rope_theta)
+                TransformerBlock(
+                    d_model,
+                    num_heads,
+                    d_ff,
+                    context_length,
+                    rope_theta,
+                    device=device,
+                    dtype=dtype,
+                )
             )
 
-        self.token_embeddings = Embedding(vocab_size, d_model)
-        self.ln_final = RMSNorm(d_model)
-        self.lm_head = Linear(d_model, vocab_size)
+        self.token_embeddings = Embedding(
+            vocab_size, d_model, device=device, dtype=dtype
+        )
+        self.ln_final = RMSNorm(d_model, device=device, dtype=dtype)
+        self.lm_head = Linear(d_model, vocab_size, device=device, dtype=dtype)
 
     def forward(
         self, in_indices: Int[Tensor, " batch_size sequence_length"]
@@ -358,21 +407,36 @@ class AdamW(torch.optim.Optimizer):
         self, params, lr=1e-3, betas=(0.9, 0.999), weight_decay=0.01, eps=1e-8
     ):
         defaults = {"lr": lr, "betas": betas, "weight_decay": weight_decay, "eps": eps}
+        self.lr_scheduling = False
         super().__init__(params, defaults)
+
+    def enable_lr_scheduling(self, lr_max, lr_min, t_w, t_c):
+        self.lr_max = lr_max
+        self.lr_min = lr_min
+        self.t_w = t_w
+        self.t_c = t_c
+        self.lr_scheduling = True
 
     def step(self, closure=None):
         loss = None if closure is None else closure()
         for group in self.param_groups:
-            lr = group["lr"]
             beta1, beta2 = group["betas"]
             eps = group["eps"]
             weight_decay = group["weight_decay"]
+
             for p in group["params"]:
                 if p.grad is None:
                     continue
                 state = self.state[p]  # Get state associated with p.
                 t = state.get("t", 1)
                 state["t"] = t + 1
+
+                if self.lr_scheduling:
+                    lr = get_cos_lr_schedule(
+                        t, self.lr_max, self.lr_min, self.t_w, self.t_c
+                    )
+                else:
+                    lr = group["lr"]
 
                 grad = p.grad.data
 
@@ -406,8 +470,8 @@ def get_cos_lr_schedule(t, lr_max, lr_min, t_w, t_c) -> float:
 
 def gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm: float):
     eps = 1e-6
-    grads = [p.grad for p in parameters if p.grad is not None]
-    total_norm = torch.norm(torch.cat(grads), p=2)
+    grads = sum([torch.sum(p.grad**2) for p in parameters if p.grad is not None])
+    total_norm = torch.sqrt(grads)
 
     scale_factor = max_l2_norm / (total_norm + eps)
     if scale_factor < 1.0:

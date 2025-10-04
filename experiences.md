@@ -322,3 +322,20 @@ LR低的时候在逐步收敛了，LR高的时候loss就起飞了
 1e1的时候收敛比较慢，1e2的时候收敛比较快，1e3无法收敛
 
 gradient clipping记得是算全局的梯度。
+
+# Experiment
+
+![](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20251004213932.png)
+
+最开始写的train代码有一点问题，没有调用optimizer.zero_grad()，所以梯度会累加，导致gradient norm越来越大。
+
+排查的思路是把step中的gradient norm打印出来，看看趋势
+
+解决后大概20多个iteration就可以把loss跑到比较低，注意这里是用了一个比较小的数据集，先测试代码可以收敛。
+
+现在这块还有一个问题就是速度过慢，我在写代码的时候没有怎么关注dtype/device，现在基本是1s一个step，这里batch size是16
+
+在mac上试了试mps，好像和纯cpu区别不大，32的batch size，都用了torch.compile，基本都是2s一个step. 看GPU监控也确实用上mps了
+
+现在有点迷惑的是不知道是不是我代码的问题，assignment里写 M3芯片，32batch size跑5000个iteration，在cpu上也只需要一个半小时，用了mps就是30多分钟。
+我这里测下来，我这个是M1，相同的batch size，5000个iteration用cpu和mps都需要3个小时
