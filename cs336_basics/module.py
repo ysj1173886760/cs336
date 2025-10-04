@@ -1,8 +1,9 @@
 import torch
-from math import sqrt, cos, sin
+from math import sqrt, cos, sin, pi
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
 from einops import einsum, rearrange
+from typing import Iterable
 
 
 class Linear(torch.nn.Module):
@@ -387,3 +388,24 @@ class AdamW(torch.optim.Optimizer):
                 p.data = p.data - lr * weight_decay * p.data
 
         return loss
+
+def get_cos_lr_schedule(t, lr_max, lr_min, t_w, t_c) -> float:
+  if t < t_w:
+    return t / t_w * lr_max
+
+  if t > t_c:
+    return lr_min
+
+  return 0.5 * (1 + cos((t - t_w) / (t_c - t_w) * pi)) * (lr_max - lr_min) + lr_min
+
+def gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm: float):
+    eps = 1e-6
+    grads = [p.grad for p in parameters if p.grad is not None]
+    total_norm = torch.norm(torch.cat(grads), p=2)
+
+    scale_factor = (max_l2_norm / (total_norm + eps))
+    if scale_factor < 1.0:
+      for p in parameters:
+        if p.grad is None:
+          continue
+        p.grad.mul_(scale_factor)

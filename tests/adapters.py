@@ -23,6 +23,8 @@ from cs336_basics.module import (
     TransformerLM,
     cross_entropy,
     AdamW,
+    get_cos_lr_schedule,
+    gradient_clipping
 )
 
 
@@ -499,7 +501,7 @@ def run_gradient_clipping(
 
     The gradients of the parameters (parameter.grad) should be modified in-place.
     """
-    raise NotImplementedError
+    return gradient_clipping(parameters, max_l2_norm)
 
 
 def get_adamw_cls() -> Any:
@@ -534,7 +536,7 @@ def run_get_lr_cosine_schedule(
     Returns:
         Learning rate at the given iteration under the specified schedule.
     """
-    raise NotImplementedError
+    return get_cos_lr_schedule(it, max_learning_rate, min_learning_rate, warmup_iters, cosine_cycle_iters)
 
 
 def run_save_checkpoint(
