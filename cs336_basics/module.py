@@ -331,3 +331,59 @@ class TransformerLM(torch.nn.Module):
         x = self.ln_final.forward(x)
         x = self.lm_head.forward(x)
         return x
+
+
+# -log softmax(oi)[x i+1] ->
+# log(sum(exp(oi))) - o[x i+1]
+def cross_entropy(
+    inputs: Float[Tensor, " batch_size vocab_size"], targets: Int[Tensor, " batch_size"]
+) -> Float[Tensor, ""]:
+    # calc max logits
+    max = torch.max(inputs, dim=-1, keepdim=True).values
+    inputs = inputs - max
+    exp_sum = torch.sum(torch.exp(inputs), dim=-1)
+
+    target_logits = torch.gather(inputs, dim=1, index=targets.unsqueeze(1))
+    loss = torch.log(exp_sum) - target_logits
+    return torch.mean(loss)
+
+
+class AdamW(torch.optim.Optimizer):
+    def __init__(
+        self, params, lr=1e-3, betas=(0.9, 0.999), weight_decay=0.01, eps=1e-8
+    ):
+        defaults = {"lr": lr, "betas": betas, "weight_decay": weight_decay, "eps": eps}
+        super().__init__(params, defaults)
+
+    def step(self, closure=None):
+        loss = None if closure is None else closure()
+        for group in self.param_groups:
+            lr = group["lr"]
+            beta1, beta2 = group["betas"]
+            eps = group["eps"]
+            weight_decay = group["weight_decay"]
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                state = self.state[p]  # Get state associated with p.
+                t = state.get("t", 1)
+                state["t"] = t + 1
+
+                grad = p.grad.data
+
+                m = state.get("m", torch.zeros_like(grad))
+                v = state.get("v", torch.zeros_like(grad))
+
+                m = beta1 * m + (1 - beta1) * grad
+                v = beta2 * v + (1 - beta2) * (grad**2)
+
+                state["m"] = m
+                state["v"] = v
+
+                lr_adjust = lr * sqrt(1 - (beta2**t)) / (1 - (beta1**t))
+
+                p.data = p.data - lr_adjust * m / (torch.sqrt(v) + eps)
+                # apply weight decay
+                p.data = p.data - lr * weight_decay * p.data
+
+        return loss

@@ -310,3 +310,13 @@ total: 1.469e+14
 ![](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20251003214714.png)
 
 需要注意的是，attention这一层的内存消耗是head * (T**2)，因为这个T * T的矩阵里记录的是softmax的分数，不会乘上d，所以内存主要消耗还是KV Cache的地方
+
+# Training
+
+Problem (learning_rate_tuning): Tuning the learning rate
+
+![](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20251004095303.png)
+
+LR低的时候在逐步收敛了，LR高的时候loss就起飞了
+
+1e1的时候收敛比较慢，1e2的时候收敛比较快，1e3无法收敛

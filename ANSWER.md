@@ -44,3 +44,5 @@ utf8的编码可以生成更少的byte，节省计算资源。生成更多的byt
 
 ![](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20250924130105.png)
 
+
+后面都放到experiences中了
