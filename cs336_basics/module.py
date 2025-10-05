@@ -184,10 +184,12 @@ class RoPE(torch.nn.Module):
         return result.reshape(*x.shape)
 
 
-def softmax(x: Float[Tensor, " ..."], dim: int) -> Float[Tensor, " ..."]:
+def softmax(
+    x: Float[Tensor, " ..."], dim: int, temperature: float = 1.0
+) -> Float[Tensor, " ..."]:
     max = torch.max(x, dim=dim, keepdim=True).values
     x = torch.sub(x, max)
-    exp = torch.exp(x)
+    exp = torch.exp(x / temperature)
     sum = torch.sum(exp, dim=dim, keepdim=True)
     return exp / sum
 
@@ -326,7 +328,9 @@ class TransformerBlock(torch.nn.Module):
         self.ffn = FFNSwiGLU(d_model, d_ff, device=device, dtype=dtype)
         self.ln2 = RMSNorm(d_model, device=device, dtype=dtype)
 
-        token_position = torch.arange(max_seq_len, device=device, dtype=torch.long).expand(1, max_seq_len)
+        token_position = torch.arange(
+            max_seq_len, device=device, dtype=torch.long
+        ).expand(1, max_seq_len)
         self.register_buffer("token_position", token_position, persistent=False)
 
     def load_weights(self, weights: dict):
@@ -459,13 +463,18 @@ def get_cos_lr_schedule(t, lr_max, lr_min, t_w, t_c) -> float:
 
     return 0.5 * (1 + cos((t - t_w) / (t_c - t_w) * pi)) * (lr_max - lr_min) + lr_min
 
+
 def calc_gradient_norm(parameters: Iterable[torch.nn.Parameter]):
     grads = sum([torch.sum(p.grad**2) for p in parameters if p.grad is not None])
     total_norm = torch.sqrt(grads)
     return total_norm
 
 
-def gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm: float, precalc_norm: float | None = None):
+def gradient_clipping(
+    parameters: Iterable[torch.nn.Parameter],
+    max_l2_norm: float,
+    precalc_norm: float | None = None,
+):
     eps = 1e-6
     if precalc_norm is None:
         total_norm = calc_gradient_norm(parameters)
@@ -516,9 +525,10 @@ def save_checkpoint(
 def load_checkpoint(
     src: str | os.PathLike | BinaryIO | IO[bytes],
     model: torch.nn.Module,
-    optimizer: torch.optim.Optimizer,
+    optimizer: torch.optim.Optimizer | None = None,
 ) -> int:
     dict = torch.load(src)
     model.load_state_dict(dict["model"])
-    optimizer.load_state_dict(dict["optimizer"])
+    if optimizer is not None:
+        optimizer.load_state_dict(dict["optimizer"])
     return dict["iteration"]

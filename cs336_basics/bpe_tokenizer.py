@@ -707,7 +707,9 @@ def calc_compression_ratio(dataset_path, tokenizer_path, sample_count=10):
 
 
 def tokenize_data(data_path, tokenizer_path, output_path):
-    tokenizer = BPETokenizer.from_files(tokenizer_path)
+    tokenizer = BPETokenizer.from_files(
+        tokenizer_path, special_tokens=["<|endoftext|>"]
+    )
     chunk_num = 1024
     batch_size = 16
     process_num = 9

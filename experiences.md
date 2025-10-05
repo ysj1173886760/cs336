@@ -417,3 +417,17 @@ MFU 50%算，一块A100就是4.8e20 / 1e13 = 4.8e7
 
 看了看wandb的曲线，大概在1000个step就可以跑到2一下的loss了。gradient clip和lr schedule都打开了
 
+![](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20251005122653.png)
+
+现在跑了4500个iteration，差不多loss是1.5，看起来还是比较平稳的，并且没有出现grad很大的情况。后面可以做一下消融实验，看看去掉lr schedule，gradient clipping之类的优化效果如何
+
+## Decode
+
+测decode的时候有几个小细节要注意一下：
+* 做的是next token prediction，用前一个位置的logits来预测当前位置。注意这里别写错
+* tokenizer要设置special tokens，我发现我tokenize出来的没有设置special token导致训练的时候special token没有被编码进去，也就无法自动停止了
+* load模型参数的时候，如果发现有奇怪的报错，可能是训练的时候用了torch compile，predict的时候没用，导致参数没对齐
+
+![](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20251005154907.png)
+
+decode出来的效果还可以，至少说明训练没啥问题，只不过这里special token处理有一点问题而已

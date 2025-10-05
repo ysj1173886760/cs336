@@ -54,8 +54,12 @@ def calc_flops(param: Params):
     print(f"attn_proj: {attn_proj:.3e} {attn_proj / total:.2%}")
     print(f"total: {total:.3e}")
 
+
 def calc_memory_training(param: Params):
-    param_mem = 12 * param.d_model * param.d_model * param.num_layers + 2 * param.vocab_size * param.d_model
+    param_mem = (
+        12 * param.d_model * param.d_model * param.num_layers
+        + 2 * param.vocab_size * param.d_model
+    )
 
     grad_mem = param_mem
 
@@ -63,7 +67,10 @@ def calc_memory_training(param: Params):
 
     optimizer_mem = 2 * param_mem
 
-    activation_mem = 9 * param.d_model * param.context_length + 2 * param.context_length * param.context_length
+    activation_mem = (
+        9 * param.d_model * param.context_length
+        + 2 * param.context_length * param.context_length
+    )
     activation_mem *= param.num_layers
     activation_mem *= param.batch_size
 
@@ -71,7 +78,10 @@ def calc_memory_training(param: Params):
     print(f"grad_mem: {sizeof_fmt(grad_mem * d_type)}")
     print(f"optimizer_mem: {sizeof_fmt(optimizer_mem * d_type)}")
     print(f"activation_mem: {sizeof_fmt(activation_mem * d_type)}")
-    print(f"total: {sizeof_fmt((param_mem + grad_mem + optimizer_mem + activation_mem) * d_type)}")
+    print(
+        f"total: {sizeof_fmt((param_mem + grad_mem + optimizer_mem + activation_mem) * d_type)}"
+    )
+
 
 if __name__ == "__main__":
     gpt_2_xl = Params(
