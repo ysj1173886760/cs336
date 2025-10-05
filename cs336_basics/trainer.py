@@ -7,6 +7,7 @@ from cs336_basics.module import (
     load_checkpoint,
     save_checkpoint,
     get_cos_lr_schedule,
+    calc_gradient_norm,
 )
 import argparse
 import numpy.typing as npt
@@ -16,17 +17,9 @@ from tqdm import tqdm
 import torch
 from math import sqrt
 import wandb
-import weave
 import time
 from datetime import datetime
-
-
-def calc_gradient_norm(model):
-    total_norm = 0
-    for p in model.parameters():
-        if p.grad is not None:
-            total_norm += torch.sum(p.grad**2)
-    return sqrt(total_norm)
+import logging
 
 
 def get_current_lr(optimizer, iteration):
@@ -86,7 +79,8 @@ def train(args, train_dataset: npt.NDArray, valid_dataset: npt.NDArray):
         betas=args.betas,
         weight_decay=args.weight_decay,
     )
-    # optimizer.enable_lr_scheduling(args.lr_max, args.lr_min, args.warmup_iterations, args.cosine_annealing_iterations)
+
+    enable_lr_scheduling = True
 
     iteration = try_load_checkpoint(args.checkpoint_path, transformer, optimizer)
 
@@ -102,17 +96,25 @@ def train(args, train_dataset: npt.NDArray, valid_dataset: npt.NDArray):
 
         loss = cross_entropy(logits, y)
 
+        current_lr = args.lr_max
+        if enable_lr_scheduling:
+            current_lr = get_cos_lr_schedule(
+                iteration, args.lr_max, args.lr_min, args.warmup_iterations, args.cosine_annealing_iterations
+            )
+            for param_group in optimizer.param_groups:
+                param_group["lr"] = current_lr
+
         optimizer.zero_grad()
         loss.backward()
 
-        # 计算梯度范数
-        grad_norm = calc_gradient_norm(transformer)
+        grad_norm = calc_gradient_norm(transformer.parameters())
+        gradient_clipping(transformer.parameters(), args.gradient_clipping, grad_norm)
 
-        # gradient_clipping(transformer.parameters(), args.gradient_clipping)
         optimizer.step()
 
-        # 获取当前学习率
-        current_lr = get_current_lr(optimizer, iteration)
+        if iteration % args.checkpoint_interval == 0:
+            save_checkpoint(transformer, optimizer, iteration, args.checkpoint_path)
+            logging.info(f"Checkpoint saved at iteration {iteration} current loss: {loss.item():.6f}")
 
         # 使用 wandb 记录指标
         if args.use_wandb:
@@ -125,12 +127,12 @@ def train(args, train_dataset: npt.NDArray, valid_dataset: npt.NDArray):
                 }
             )
 
-        if iteration % 1 == 0:
-            print(
-                f"time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | Iteration {iteration} | Loss: {loss.item():.6f}"
+        if iteration % 100 == 0:
+            logging.info(
+                f"Iteration {iteration} | Loss: {loss.item():.6f}"
             )
-            print(f"Gradient Norm: {grad_norm}")
-            print(f"Learning Rate: {current_lr}")
+            logging.info(f"Gradient Norm: {grad_norm:.3e}")
+            logging.info(f"Learning Rate: {current_lr:.3e}")
 
     # 训练完成后关闭 wandb
     if args.use_wandb:
@@ -148,6 +150,8 @@ def load_data(data_path) -> npt.NDArray:
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--vocab_size", type=int, default=10000)
     parser.add_argument("--context_length", type=int, default=256)
@@ -162,11 +166,14 @@ if __name__ == "__main__":
 
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--batch_size", type=int, default=32)
-    parser.add_argument("--checkpoint_path", type=str, default="checkpoint.pt")
     parser.add_argument("--max_iterations", type=int, default=5000)
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--betas", type=tuple, default=(0.9, 0.999))
     parser.add_argument("--gradient_clipping", type=float, default=1.0)
+
+    parser.add_argument("--checkpoint_path", type=str, default="checkpoints/checkpoint.pt")
+    parser.add_argument("--checkpoint_interval", type=int, default=100)
+    
     # lr schedule params
     parser.add_argument("--lr_max", type=float, default=1e-3)
     parser.add_argument("--lr_min", type=float, default=1e-5)
@@ -183,6 +190,6 @@ if __name__ == "__main__":
     train_dataset = load_data(args.train_data_path)
     valid_dataset = load_data(args.valid_data_path)
 
+    # train_dataset = train_dataset[:10000]
     train(args, train_dataset, valid_dataset)
-    # valid_dataset = valid_dataset[:50000]
     # train(args, valid_dataset, valid_dataset)

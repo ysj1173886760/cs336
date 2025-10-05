@@ -323,6 +323,73 @@ LR低的时候在逐步收敛了，LR高的时候loss就起飞了
 
 gradient clipping记得是算全局的梯度。
 
+## Resource accounting
+
+这里还有一个训练阶段的resource accounting，主要看内存
+
+### 参数
+
+参数内存之前也算过，如果dff按照8/3 d_model算的话，总体的参数量应该是12 * d_model * d_model * layer + 2 * vocab_size * d_model
+
+### 梯度
+
+梯度和参数的数量是一样的, dtype也是一样的
+
+### Activation
+
+这里列出来有点多，我单独放到一个地方写一下文章吧，结论是大概为(9 * d_model * seq_len + 2 * seq_len * seq_len) * layer
+
+这里主要算的是transformer那块，没有带上embedding和lm head的
+
+最后再乘一个batch size 
+
+### Optimizer
+
+对于每一个参数，AdamW会存两个值，m和v，m是梯度的一阶矩，v是梯度的二阶矩。
+一般是fp32存，数量是 2 * Parameters
+
+gpt2_xl
+param_mem: 6.1GB
+grad_mem: 6.1GB
+optimizer_mem: 12.2GB
+activation_mem: 3.0GB
+total: 27.4GB
+
+一旦batch size大了，activation mem的占用量会急剧上升
+
+对于GPT2_XL，放到80G的显存上的话。公式就是3 * batch_size + 24.4 <= 80. 
+batch_size最大是18
+
+然后adamW的计算量为:
+* 计算m: 两次乘一次加，3 * param
+* 计算v: 两次乘一次加，一次平方，4 * param
+* 更新data: 一次乘，一次开方，一次除，一次减，一次加， (4 + 20) * param，开方按照20次算的
+* weight decay: 一次乘，一次减， 2*param
+
+总共是33 * param次
+
+第四题，按照上面算的，batch_size为1024应该无法放入显存中，我就只按照flops算了
+
+gpt xl的前向传播是4.349e+12
+反向传播乘个2，就是8.698e+12
+参数更新大概是7e10，直接忽略掉。然后乘上batch size，1.33e+16
+
+A100的峰值是19.5e12, mfu 50%就是9.75e12
+差不多一个batch需要1000s
+
+400K个step，需要跑 400k * 1000 / 86400 = 4629天
+
+看起来跑一个GPT2也远远不是单卡可以搞定的，无论是需要的计算量还是显存瓶颈
+
+GPT老师给拓展了一下，我们用scaling law算一下：
+
+GPT2_XL的参数按照2e9算，需要的token是20 * N = 4e10
+注意力长度比较短的时候，一个token大概需要6 * N 的flops
+
+那么需要的flops就是4e10 * 6 * 2e9 = 4.8e20
+MFU 50%算，一块A100就是4.8e20 / 1e13 = 4.8e7
+100块A100就是4.8e5 ~= 5天 （不算scalbility的问题）
+
 # Experiment
 
 ![](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20251004213932.png)
@@ -339,3 +406,14 @@ gradient clipping记得是算全局的梯度。
 
 现在有点迷惑的是不知道是不是我代码的问题，assignment里写 M3芯片，32batch size跑5000个iteration，在cpu上也只需要一个半小时，用了mps就是30多分钟。
 我这里测下来，我这个是M1，相同的batch size，5000个iteration用cpu和mps都需要3个小时
+
+优化了一波还是差不多2s 32个batch，cpu和mps差不多。不过发现一个问题是打开gradient norm之后，mps上的gradient会直接爆炸，loss就飞起来了，但是cpu上没有问题，不知道是啥原因，就用cpu训练了。
+
+2025-10-05 11:26:24,209 - INFO - Iteration 3000 | Loss: 1.656939
+2025-10-05 11:26:24,209 - INFO - Gradient Norm: 3.549e-01
+2025-10-05 11:26:24,209 - INFO - Learning Rate: 3.769e-04
+
+在tiny story上3000个step跑到了1.65的loss，M1跑了两个小时
+
+看了看wandb的曲线，大概在1000个step就可以跑到2一下的loss了。gradient clip和lr schedule都打开了
+

@@ -246,6 +246,9 @@ class MultiHeadSelfAttention(torch.nn.Module):
             self.d_model, self.d_model, device=device, dtype=dtype
         )
 
+        casual_mask = self.construct_causal_mask(max_seq_len)
+        self.register_buffer("casual_mask", casual_mask, persistent=False)
+
     def load_weights(
         self,
         q_proj_weight: Float[Tensor, " d_k d_in"],
@@ -295,7 +298,7 @@ class MultiHeadSelfAttention(torch.nn.Module):
             k_proj = self.rope.forward(k_proj, token_positions.unsqueeze(1))
 
         sequence_length = x.shape[-2]
-        causal_mask = self.construct_causal_mask(sequence_length)
+        causal_mask = self.casual_mask[:sequence_length]
 
         # 必须要先split head再去算attention，否则算的时候会把整个d_model都用来算atten score，就没有多头了
         attention = scaled_dot_product_attention(q_proj, k_proj, v_proj, causal_mask)
@@ -323,6 +326,9 @@ class TransformerBlock(torch.nn.Module):
         self.ffn = FFNSwiGLU(d_model, d_ff, device=device, dtype=dtype)
         self.ln2 = RMSNorm(d_model, device=device, dtype=dtype)
 
+        token_position = torch.arange(max_seq_len, device=device, dtype=torch.long).expand(1, max_seq_len)
+        self.register_buffer("token_position", token_position, persistent=False)
+
     def load_weights(self, weights: dict):
         self.load_state_dict(weights)
 
@@ -331,7 +337,7 @@ class TransformerBlock(torch.nn.Module):
         x: Float[Tensor, " batch sequence_length d_model"],
     ) -> Float[Tensor, " batch sequence_length d_model"]:
         b, s, _ = x.shape
-        token_position = torch.arange(s, device=x.device, dtype=torch.long).expand(b, s)
+        token_position = self.token_position[:s]
 
         y = x + self.attn.forward(self.ln1.forward(x), token_position)
 
@@ -407,15 +413,7 @@ class AdamW(torch.optim.Optimizer):
         self, params, lr=1e-3, betas=(0.9, 0.999), weight_decay=0.01, eps=1e-8
     ):
         defaults = {"lr": lr, "betas": betas, "weight_decay": weight_decay, "eps": eps}
-        self.lr_scheduling = False
         super().__init__(params, defaults)
-
-    def enable_lr_scheduling(self, lr_max, lr_min, t_w, t_c):
-        self.lr_max = lr_max
-        self.lr_min = lr_min
-        self.t_w = t_w
-        self.t_c = t_c
-        self.lr_scheduling = True
 
     def step(self, closure=None):
         loss = None if closure is None else closure()
@@ -423,6 +421,7 @@ class AdamW(torch.optim.Optimizer):
             beta1, beta2 = group["betas"]
             eps = group["eps"]
             weight_decay = group["weight_decay"]
+            lr = group["lr"]
 
             for p in group["params"]:
                 if p.grad is None:
@@ -430,13 +429,6 @@ class AdamW(torch.optim.Optimizer):
                 state = self.state[p]  # Get state associated with p.
                 t = state.get("t", 1)
                 state["t"] = t + 1
-
-                if self.lr_scheduling:
-                    lr = get_cos_lr_schedule(
-                        t, self.lr_max, self.lr_min, self.t_w, self.t_c
-                    )
-                else:
-                    lr = group["lr"]
 
                 grad = p.grad.data
 
@@ -467,11 +459,18 @@ def get_cos_lr_schedule(t, lr_max, lr_min, t_w, t_c) -> float:
 
     return 0.5 * (1 + cos((t - t_w) / (t_c - t_w) * pi)) * (lr_max - lr_min) + lr_min
 
-
-def gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm: float):
-    eps = 1e-6
+def calc_gradient_norm(parameters: Iterable[torch.nn.Parameter]):
     grads = sum([torch.sum(p.grad**2) for p in parameters if p.grad is not None])
     total_norm = torch.sqrt(grads)
+    return total_norm
+
+
+def gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm: float, precalc_norm: float | None = None):
+    eps = 1e-6
+    if precalc_norm is None:
+        total_norm = calc_gradient_norm(parameters)
+    else:
+        total_norm = precalc_norm
 
     scale_factor = max_l2_norm / (total_norm + eps)
     if scale_factor < 1.0:
