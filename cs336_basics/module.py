@@ -248,9 +248,6 @@ class MultiHeadSelfAttention(torch.nn.Module):
             self.d_model, self.d_model, device=device, dtype=dtype
         )
 
-        casual_mask = self.construct_causal_mask(max_seq_len)
-        self.register_buffer("casual_mask", casual_mask, persistent=False)
-
     def load_weights(
         self,
         q_proj_weight: Float[Tensor, " d_k d_in"],
@@ -300,7 +297,7 @@ class MultiHeadSelfAttention(torch.nn.Module):
             k_proj = self.rope.forward(k_proj, token_positions.unsqueeze(1))
 
         sequence_length = x.shape[-2]
-        causal_mask = self.casual_mask[:sequence_length]
+        causal_mask = self.construct_causal_mask(sequence_length)
 
         # 必须要先split head再去算attention，否则算的时候会把整个d_model都用来算atten score，就没有多头了
         attention = scaled_dot_product_attention(q_proj, k_proj, v_proj, causal_mask)
@@ -330,7 +327,7 @@ class TransformerBlock(torch.nn.Module):
 
         token_position = torch.arange(
             max_seq_len, device=device, dtype=torch.long
-        ).expand(1, max_seq_len)
+        )
         self.register_buffer("token_position", token_position, persistent=False)
 
     def load_weights(self, weights: dict):
@@ -341,7 +338,7 @@ class TransformerBlock(torch.nn.Module):
         x: Float[Tensor, " batch sequence_length d_model"],
     ) -> Float[Tensor, " batch sequence_length d_model"]:
         b, s, _ = x.shape
-        token_position = self.token_position[:s]
+        token_position = self.token_position[:s].unsqueeze(0)
 
         y = x + self.attn.forward(self.ln1.forward(x), token_position)
 
